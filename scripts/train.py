@@ -1,174 +1,198 @@
-import cv2
-import numpy
-import time
+#!/usr/bin python3
+""" The script to run the training process of faceswap """
 
-from threading import Lock
-from lib.utils import get_image_paths, get_folder
-from lib.cli import FullPaths
+import os
+import sys
+import threading
+
+import cv2
+import tensorflow as tf
+from keras.backend.tensorflow_backend import set_session
+
+from lib.utils import get_folder, get_image_paths, set_system_verbosity
 from plugins.PluginLoader import PluginLoader
 
-class TrainingProcessor(object):
-    arguments = None
 
-    def __init__(self, subparser, command, description='default'):
-        self.parse_arguments(description, subparser, command)
-        self.lock = Lock()
-
-    def process_arguments(self, arguments):
-        self.arguments = arguments
-        print("Model A Directory: {}".format(self.arguments.input_A))
-        print("Model B Directory: {}".format(self.arguments.input_B))
-        print("Training data directory: {}".format(self.arguments.model_dir))
-
-        self.process()
-
-    def parse_arguments(self, description, subparser, command):
-        parser = subparser.add_parser(
-            command,
-            help="This command trains the model for the two faces A and B.",
-            description=description,
-            epilog="Questions and feedback: \
-            https://github.com/deepfakes/faceswap-playground"
-        )
-
-        parser.add_argument('-A', '--input-A',
-                            action=FullPaths,
-                            dest="input_A",
-                            default="input_A",
-                            help="Input directory. A directory containing training images for face A.\
-                             Defaults to 'input'")
-        parser.add_argument('-B', '--input-B',
-                            action=FullPaths,
-                            dest="input_B",
-                            default="input_B",
-                            help="Input directory. A directory containing training images for face B.\
-                             Defaults to 'input'")
-        parser.add_argument('-m', '--model-dir',
-                            action=FullPaths,
-                            dest="model_dir",
-                            default="models",
-                            help="Model directory. This is where the training data will \
-                                be stored. Defaults to 'model'")
-        parser.add_argument('-p', '--preview',
-                            action="store_true",
-                            dest="preview",
-                            default=False,
-                            help="Show preview output. If not specified, write progress \
-                            to file.")
-        parser.add_argument('-v', '--verbose',
-                            action="store_true",
-                            dest="verbose",
-                            default=False,
-                            help="Show verbose output")
-        parser.add_argument('-s', '--save-interval',
-                            type=int,
-                            dest="save_interval",
-                            default=100,
-                            help="Sets the number of iterations before saving the model.")
-        parser.add_argument('-w', '--write-image',
-                            action="store_true",
-                            dest="write_image",
-                            default=False,
-                            help="Writes the training result to a file even on preview mode.")
-        parser.add_argument('-t', '--trainer',
-                            type=str,
-                            choices=("Original", "LowMem", "GAN"),
-                            default="Original",
-                            help="Select which trainer to use, LowMem for cards < 2gb.")
-        parser.add_argument('-bs', '--batch-size',
-                            type=int,
-                            default=64,
-                            help="Batch size, as a power of 2 (64, 128, 256, etc)")
-        parser = self.add_optional_arguments(parser)
-        parser.set_defaults(func=self.process_arguments)
-
-    def add_optional_arguments(self, parser):
-        # Override this for custom arguments
-        return parser
-
-    def process(self):
-        import threading
+class Train(object):
+    """ The training process.  """
+    def __init__(self, arguments):
+        self.args = arguments
+        self.images = self.get_images()
         self.stop = False
         self.save_now = False
+        self.preview_buffer = dict()
+        self.lock = threading.Lock()
 
-        thr = threading.Thread(target=self.processThread, args=(), kwargs={})
-        thr.start()
-
-        if self.arguments.preview:
-            print('Using live preview')
-            while True:
-                try:
-                    with self.lock:
-                        for name, image in self.preview_buffer.items():
-                            cv2.imshow(name, image)
-
-                    key = cv2.waitKey(1000)
-                    if key == ord('\n') or key == ord('\r'):
-                        break
-                    if key == ord('s'):
-                        self.save_now = True
-                except KeyboardInterrupt:
-                    break
-        else:
-            input() # TODO how to catch a specific key instead of Enter?
-            # there isnt a good multiplatform solution: https://stackoverflow.com/questions/3523174/raw-input-in-python-without-pressing-enter
-
-        print("Exit requested! The trainer will complete its current cycle, save the models and quit (it can take up a couple of seconds depending on your training speed). If you want to kill it now, press Ctrl + c")
-        self.stop = True
-        thr.join() # waits until thread finishes
-
-    def processThread(self):
-        print('Loading data, this may take a while...')
         # this is so that you can enter case insensitive values for trainer
-        trainer = self.arguments.trainer
-        trainer = "LowMem" if trainer.lower() == "lowmem" else trainer
-        model = PluginLoader.get_model(trainer)(get_folder(self.arguments.model_dir))
-        model.load(swapped=False)
+        trainer_name = self.args.trainer
+        self.trainer_name = "LowMem" if trainer_name.lower() == "lowmem" else trainer_name
 
-        images_A = get_image_paths(self.arguments.input_A)
-        images_B = get_image_paths(self.arguments.input_B)
-        trainer = PluginLoader.get_trainer(trainer)
-        trainer = trainer(model, images_A, images_B, batch_size=self.arguments.batch_size)
+    def process(self):
+        """ Call the training process object """
+        print("Training data directory: {}".format(self.args.model_dir))
+        lvl = '0' if self.args.verbose else '2'
+        set_system_verbosity(lvl)
+        thread = self.start_thread()
 
+        if self.args.preview:
+            self.monitor_preview()
+        else:
+            self.monitor_console()
+
+        self.end_thread(thread)
+
+    def get_images(self):
+        """ Check the image dirs exist, contain images and return the image
+        objects """
+        images = []
+        for image_dir in [self.args.input_A, self.args.input_B]:
+            if not os.path.isdir(image_dir):
+                print('Error: {} does not exist'.format(image_dir))
+                exit(1)
+
+            if not os.listdir(image_dir):
+                print('Error: {} contains no images'.format(image_dir))
+                exit(1)
+
+            images.append(get_image_paths(image_dir))
+        print("Model A Directory: {}".format(self.args.input_A))
+        print("Model B Directory: {}".format(self.args.input_B))
+        return images
+
+    def start_thread(self):
+        """ Put the training process in a thread so we can keep control """
+        thread = threading.Thread(target=self.process_thread)
+        thread.start()
+        return thread
+
+    def end_thread(self, thread):
+        """ On termination output message and join thread back to main """
+        print("Exit requested! The trainer will complete its current cycle, "
+              "save the models and quit (it can take up a couple of seconds "
+              "depending on your training speed). If you want to kill it now, "
+              "press Ctrl + c")
+        self.stop = True
+        thread.join()
+        sys.stdout.flush()
+
+    def process_thread(self):
+        """ The training process to be run inside a thread """
         try:
-            print('Starting. Press "Enter" to stop training and save model')
+            print("Loading data, this may take a while...")
 
-            for epoch in range(0, 1000000):
+            if self.args.allow_growth:
+                self.set_tf_allow_growth()
 
-                save_iteration = epoch % self.arguments.save_interval == 0
+            model = self.load_model()
+            trainer = self.load_trainer(model)
 
-                trainer.train_one_step(epoch, self.show if (save_iteration or self.save_now) else None)
-
-                if save_iteration:
-                    model.save_weights()
-
-                if self.stop:
-                    model.save_weights()
-                    exit()
-
-                if self.save_now:
-                    model.save_weights()
-                    self.save_now = False
-
+            self.run_training_cycle(model, trainer)
         except KeyboardInterrupt:
             try:
                 model.save_weights()
             except KeyboardInterrupt:
-                print('Saving model weights has been cancelled!')
+                print("Saving model weights has been cancelled!")
             exit(0)
-        except Exception as e:
-            print(e)
-            exit(1)
-    
-    preview_buffer = {}
+        except Exception as err:
+            raise err
 
-    def show(self, image, name=''):
+    def load_model(self):
+        """ Load the model requested for training """
+        model_dir = get_folder(self.args.model_dir)
+        model = PluginLoader.get_model(self.trainer_name)(model_dir, self.args.gpus)
+
+        model.load(swapped=False)
+        return model
+
+    def load_trainer(self, model):
+        """ Load the trainer requested for training """
+        images_a, images_b = self.images
+
+        trainer = PluginLoader.get_trainer(self.trainer_name)
+        trainer = trainer(model,
+                          images_a,
+                          images_b,
+                          self.args.batch_size,
+                          self.args.perceptual_loss)
+        return trainer
+
+    def run_training_cycle(self, model, trainer):
+        """ Perform the training cycle """
+        for iteration in range(0, self.args.iterations):
+            save_iteration = iteration % self.args.save_interval == 0
+            viewer = self.show if save_iteration or self.save_now else None
+            trainer.train_one_step(iteration, viewer)
+            if self.stop:
+                break
+            elif save_iteration:
+                model.save_weights()
+            elif self.save_now:
+                model.save_weights()
+                self.save_now = False
+        model.save_weights()
+        self.stop = True
+
+    def monitor_preview(self):
+        """ Generate the preview window and wait for keyboard input """
+        print("Using live preview.\n"
+              "Press 'ENTER' on the preview window to save and quit.\n"
+              "Press 'S' on the preview window to save model weights "
+              "immediately")
+        while True:
+            try:
+                with self.lock:
+                    for name, image in self.preview_buffer.items():
+                        cv2.imshow(name, image)
+
+                key = cv2.waitKey(1000)
+                if key == ord("\n") or key == ord("\r"):
+                    break
+                if key == ord("s"):
+                    self.save_now = True
+                if self.stop:
+                    break
+            except KeyboardInterrupt:
+                break
+
+    @staticmethod
+    def monitor_console():
+        """ Monitor the console for any input followed by enter or ctrl+c """
+        # TODO: how to catch a specific key instead of Enter?
+        # there isn't a good multiplatform solution:
+        # https://stackoverflow.com/questions/3523174
+        # TODO: Find a way to interrupt input() if the target iterations are reached.
+        # At the moment, setting a target iteration and using the -p flag is
+        # the only guaranteed way to exit the training loop on hitting target
+        # iterations.
+        print("Starting. Press 'ENTER' to stop training and save model")
         try:
-            if self.arguments.preview:
+            input()
+        except KeyboardInterrupt:
+            pass
+
+    @staticmethod
+    def set_tf_allow_growth():
+        """ Allow TensorFlow to manage VRAM growth """
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        config.gpu_options.visible_device_list = "0"
+        set_session(tf.Session(config=config))
+
+    def show(self, image, name=""):
+        """ Generate the preview and write preview file output """
+        try:
+            scriptpath = os.path.realpath(os.path.dirname(sys.argv[0]))
+            if self.args.write_image:
+                img = "_sample_{}.jpg".format(name)
+                imgfile = os.path.join(scriptpath, img)
+                cv2.imwrite(imgfile, image)
+            if self.args.redirect_gui:
+                img = ".gui_preview_{}.jpg".format(name)
+                imgfile = os.path.join(scriptpath, "lib", "gui", ".cache", "preview", img)
+                cv2.imwrite(imgfile, image)
+            if self.args.preview:
                 with self.lock:
                     self.preview_buffer[name] = image
-            elif self.arguments.write_image:
-                cv2.imwrite('_sample_{}.jpg'.format(name), image)
-        except Exception as e:
+        except Exception as err:
             print("could not preview sample")
-            print(e)
+            raise err
